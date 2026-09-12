@@ -347,19 +347,50 @@ US_STATE_ABBR = {
     "VA", "WA", "WV", "WI", "WY",
 }
 
+# en_core_web_sm's NER is noticeably weaker on Indian city names (e.g. it
+# tags "Pune" as ORG in most resume-header contexts) — a state-name regex
+# fallback catches the common "City, State" format those cases fall through.
+INDIAN_STATES = {
+    "andhra pradesh", "arunachal pradesh", "assam", "bihar", "chhattisgarh", "goa", "gujarat",
+    "haryana", "himachal pradesh", "jharkhand", "karnataka", "kerala", "madhya pradesh",
+    "maharashtra", "manipur", "meghalaya", "mizoram", "nagaland", "odisha", "punjab",
+    "rajasthan", "sikkim", "tamil nadu", "telangana", "tripura", "uttar pradesh",
+    "uttarakhand", "west bengal", "delhi",
+}
+
+
+# Cities en_core_web_sm frequently mistags as PERSON/ORG on short,
+# unpunctuated resume headers (verified: Pune, Bangalore, Austin all fail
+# NER in this context) — checked only as a last resort after NER and the
+# state-name regexes above have already had their chance.
+MAJOR_CITIES = [
+    "Bangalore", "Bengaluru", "Pune", "Hyderabad", "Chennai", "Kolkata", "Ahmedabad",
+    "Jaipur", "Lucknow", "Nagpur", "Bhopal", "Chandigarh", "Kochi", "Coimbatore",
+    "Austin", "Dallas", "Houston", "Phoenix", "Denver", "Portland", "Nashville",
+    "Columbus", "Charlotte", "Atlanta", "Miami", "Orlando", "Pittsburgh",
+]
+
 
 def _regex_location_fallback(text: str):
-    """Small NER models miss short, sentence-less resume headers like
-    "Austin, TX" fairly often (no surrounding grammar to disambiguate a
-    place from a name) — this catches the extremely common "City, ST"
-    pattern as a deterministic backstop when NER comes up empty."""
+    """Small NER models miss short, sentence-less resume headers fairly
+    often (no surrounding grammar to disambiguate a place from a name) —
+    this catches two extremely common header formats as a deterministic
+    backstop when NER comes up empty: "City, ST" (US) and "City, State"
+    (India)."""
     header = text[:400]
     # NB: the inter-word separator is a literal space, not \s — \s matches
     # newlines too, which previously let this bridge across lines (e.g.
     # "Kumar\nAustin, TX" got misread as one two-word city name).
-    m = re.search(r"\b([A-Z][a-zA-Z.]+(?: [A-Z][a-zA-Z.]+)?),[ ]*([A-Z]{2})\b", header)
+    name_re = r"[A-Z][a-zA-Z.]+(?: [A-Z][a-zA-Z.]+)?"
+    m = re.search(rf"\b({name_re}),[ ]*([A-Z]{{2}})\b", header)
     if m and m.group(2) in US_STATE_ABBR:
         return f"{m.group(1)}, {m.group(2)}"
+    # Lookahead allows a trailing separator (comma/period/newline/end) OR a
+    # space before a pincode/dash, so "Pune, Maharashtra - 411001" matches
+    # instead of being rejected for not ending cleanly at "Maharashtra".
+    m = re.search(rf"\b({name_re}),[ ]*([A-Z][a-zA-Z ]+?)\b(?=[,.\n]|\s*[-\d]|$)", header)
+    if m and m.group(2).strip().lower() in INDIAN_STATES:
+        return f"{m.group(1)}, {m.group(2).strip()}"
     return None
 
 
@@ -377,12 +408,29 @@ _LOCATION_DENYLIST = {s.lower() for s in SKILL_VOCAB.keys()} | {
 def extract_location(text: str):
     """Named-entity recognition over the resume header (where a candidate's
     city/address is almost always stated) to pull a GPE (geo-political
-    entity) — e.g. "Bangalore" or "Austin, TX" — falling back to a regex
-    pattern for the common "City, ST" header format NER sometimes misses on
-    text this short and unstructured. Returns None rather than a guess."""
+    entity) — e.g. "Bangalore" or "Austin, TX" — falling back to regex
+    patterns for header formats NER sometimes misses. Returns None rather
+    than a guess.
+
+    Order matters here: the gazetteer runs first because it targets cities
+    en_core_web_sm is *known* to mistag (Pune, Bangalore, Austin) — if NER
+    ran first it would "succeed" on those headers by returning the country
+    instead (e.g. "Bangalore, India" -> "India"), masking the better answer."""
+    header = text[:600]
+    for city in MAJOR_CITIES:
+        if re.search(rf"\b{re.escape(city)}\b", header, re.IGNORECASE):
+            return city
+
     nlp = _get_ner_model()
     if nlp:
-        doc = nlp(text[:600])
+        # Resume headers pack name/title/contact/location onto separate
+        # lines with no punctuation between them. Without a real sentence
+        # boundary there, spaCy's NER regularly merges the line above into
+        # a PERSON entity (e.g. "Kevin Zhang\nToronto" tagged as one name),
+        # swallowing the city. Turning line/pipe breaks into ". " gives it
+        # the grammatical boundary it needs to separate them correctly.
+        cleaned = re.sub(r"[\n|]+", ". ", header)
+        doc = nlp(cleaned)
         gpes = [
             ent.text.strip() for ent in doc.ents
             if ent.label_ in ("GPE", "LOC")
