@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+# Replace 'resumeit.com' with your actual domain name once deployed!
+Sitemap: https://resumeeit.com/sitemap.xml
